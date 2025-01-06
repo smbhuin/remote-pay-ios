@@ -99,18 +99,17 @@ DESC
   s.author           = { 'Clover' => 'semi-integrations@clover.com' }
   s.source           = { :git => 'https://github.com/clover/remote-pay-ios.git', :tag => s.version.to_s }
 
-  s.pod_target_xcconfig = { 'SWIFT_VERSION' => '5.3' }
-
-  s.ios.deployment_target = '9.0'
+  # s.pod_target_xcconfig = { 'SWIFT_VERSION' => '5.3' }
+  s.swift_version = '5.0'
+  s.ios.deployment_target = '12.0'
   s.osx.deployment_target = '10.10'
-# s.watchos.deployment_target = '2.0'
+  # s.watchos.deployment_target = '2.0'
 
   s.source_files = 'CloverConnector/Classes/**/*.swift'
   
-
   # s.public_header_files = 'Pod/Classes/**/*.h'
   s.frameworks = 'Foundation'
-  s.dependency 'ObjectMapper', '3.5.1'
-  s.dependency 'Starscream', '3.1.0'
-  s.dependency 'SwiftyJSON', '5.0.0'
+  s.dependency 'ObjectMapper', '~> 3.5'
+  s.dependency 'Starscream', '~> 4.0.6'
+  s.dependency 'SwiftyJSON', '5.0.2'
 end

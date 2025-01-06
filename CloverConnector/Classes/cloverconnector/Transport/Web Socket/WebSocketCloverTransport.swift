@@ -10,9 +10,12 @@ import Foundation
 import Starscream
 import ObjectMapper
 
-class WebSocketCloverTransport: CloverTransport {
+class WebSocketCloverTransport: CloverTransport, WebSocketDelegate {
     var socket:WebSocket?
     fileprivate var disposed = false
+    fileprivate var isConnected = false
+    fileprivate var pairing = false
+
     fileprivate var reportDisconnectTimer:Timer? // if the client wants to be notified sooner than an actual timeout, this timer will do it
     fileprivate var disconnectTimer:Timer? // if a pong hadn't been received in this amount of time after a ping is sent, disconnect the websocket
     fileprivate var pingTimer:Timer? // how long after a pong will the next ping be sent
@@ -70,7 +73,6 @@ class WebSocketCloverTransport: CloverTransport {
     
     override func initialize() {
         if let ep = self.endpoint {
-            
             initialize(ep)
         } else {
             CCLog.w("endpoint is nil")
@@ -79,17 +81,19 @@ class WebSocketCloverTransport: CloverTransport {
     
     func initialize(_ endpoint:URL) {
         self.endpoint = endpoint
-        if let s = socket {
-            if s.isConnected {
+        if let _ = socket {
+            if self.isConnected {
                 return
             }
         }
+        let request = URLRequest(url: endpoint)
+        socket = WebSocket(request: request)
+        socket?.delegate = self
         
-        socket = WebSocket(url: endpoint)
-
         if let socket = socket {
             var pairing = false;
-            socket.onConnect = { [weak self] in
+            
+            /*socket.onConnect = { [weak self] in
                 guard let processQueue = self?.processQueue else { return }
                 processQueue.async(execute: { [weak self] in
                     CCLog.d("websocket is connected")
@@ -206,15 +210,146 @@ class WebSocketCloverTransport: CloverTransport {
 //                Log.d(". " + self.df.stringFromDate(NSDate()))
                     self?.resetPong()
                 })
-            }
+            }*/
+            
             // This only works in newer versions of Starscream
-            socket.disableSSLCertValidation = disableSSLValidation
+            //socket.disableSSLCertValidation = disableSSLValidation
+            
             if(disableSSLValidation) {
                 CCLog.d("SSL Validation is turned off!")
             }
             CCLog.d("trying to connect")
-            socket.connect(pongTimeout)
+            //socket.connect(pongTimeout)
+            socket.connect()
         }
+    }
+    
+    func didReceive(event: WebSocketEvent, client: WebSocketClient) {
+        switch event {
+        case .connected(_):
+            
+            self.isConnected = true
+            self.processQueue.async(execute: { [weak self] in
+                CCLog.d("websocket is connected")
+                self?.pairing = true
+                self?.schedulePing()
+                self?.sendPairingRequest()
+            })
+            
+            case .disconnected(let reason, let code):
+            
+            self.isConnected = false
+            
+            self.processQueue.async(execute: { [weak self] in
+                
+                guard let self = self else {
+                    CCLog.d("onDisconnect called on orphaned socket")
+                    return
+                }
+                
+                CCLog.d("websocket is disconnected: " + reason)
+                let err = NSError(domain: "WSError", code: Int(code), userInfo: [NSLocalizedFailureReasonErrorKey:reason])
+                for obs in self.observers {
+                    obs.onDeviceError(.CONNECTION_ERROR, int: Int(code), cause: err, message: reason)
+                }
+                
+                for obs in self.observers {
+                    obs.onDeviceDisconnected(self)
+                }
+                
+                self.disconnectTimer?.invalidate()
+                self.reportDisconnectTimer?.invalidate()
+                
+                self.socket = nil
+                
+                if self.disposed {
+                    return
+                }
+                
+                let delayTime = DispatchTime.now() + Double(Int64(Double(self.reconnectDelay) * Double(NSEC_PER_SEC))) / Double(NSEC_PER_SEC)
+                DispatchQueue.global(qos: DispatchQoS.QoSClass.default).asyncAfter(deadline: delayTime, execute: {
+                    if let ep = self.endpoint {
+                        self.initialize(ep)
+                    }
+                })
+            })
+            
+            case .text(let text):
+            processQueue.async(execute: { [weak self] in
+                guard let self = self else {
+                    CCLog.d("onText called on orphaned socket")
+                    return
+                }
+                
+                CCLog.d("websocket onText: " + text)
+                self.resetPong()
+                if (pairing) {
+                    let parser:Mapper<PairingResponseMessage> = Mapper<PairingResponseMessage>()
+                    let remoteMessage = parser.map(JSONString: text)
+                    if(remoteMessage?.method == PairingCode.PAIRING_CODE && remoteMessage?.payload != nil) {
+                        if let pcm:PairingCodeMessage = Mapper<PairingCodeMessage>().map(JSONString: remoteMessage!.payload!), let code = pcm.pairingCode {
+                            CCLog.d("Got pairing code: " + code)
+                            self.pairingConfig.onPairingCode(code)
+                        } else {
+                            CCLog.w("Error getting pairing code from: " + text)
+                        }
+                        
+                    } else if (remoteMessage?.method == PairingCode.PAIRING_RESPONSE && remoteMessage?.payload != nil) {
+                        if let pr:PairingResponse = Mapper<PairingResponse>().map(JSONString: remoteMessage!.payload!), let authToken = pr.authenticationToken {
+                            if pr.pairingState == PairingCode.INITIAL || pr.pairingState == PairingCode.PAIRED {
+                                pairing = false;
+                                self.pairingAuthToken = authToken
+                                CCLog.d("pairing successful " + authToken)
+                                self.pairingConfig.onPairingSuccess(authToken)
+                                
+                                for obs in self.observers {
+                                    obs.onDeviceReady(self)
+                                }
+                            } else if pr.pairingState == PairingCode.FAILED {
+                                pairing = true
+                                CCLog.d("pairing failed")
+                                self.pairingAuthToken = nil
+                                //self.sendPairingRequest() // fail causes a disconnect, so this is taken care of in reconnect
+                            }
+                        }
+                    } else {
+                        if(remoteMessage?.method != "ACK" && remoteMessage?.method != "UI_STATE") {
+                            CCLog.w("Error parsing message: " + text)
+                        } else {
+                            // we expect ACK and UI_STATE messages while pairing
+                        }
+                    }
+                } else {
+                    DispatchQueue.global(qos: DispatchQoS.QoSClass.default).async {
+                        for obs in self.observers {
+                            obs.onMessage(text)
+                        }
+                    }
+                }
+            })
+            
+            case .binary(let data):
+            processQueue.async(execute: {
+                CCLog.d("got some data: " + String(describing: data)) // don't expect this
+            })
+            case .ping(_):
+                break
+            case .pong(_):
+            processQueue.async(execute: { [weak self] in
+//              Log.d(". " + self.df.stringFromDate(NSDate()))
+                self?.resetPong()
+            })
+            case .viabilityChanged(_):
+                break
+            case .reconnectSuggested(_):
+                break
+            case .cancelled:
+                isConnected = false
+            case .error(let error):
+                isConnected = false
+            case .peerClosed:
+                break
+            }
     }
 
     
@@ -290,6 +425,7 @@ class WebSocketCloverTransport: CloverTransport {
             self.disconnectTimer = Timer.scheduledTimer(timeInterval: Double(self.pongTimeout), target: self, selector: #selector(self.disconnectMissedPong), userInfo: nil, repeats: false)
         })
     }
+    
     @objc fileprivate func reportDisconnect() {
         processQueue.async(execute: { [weak self] in
             guard let self = self else { return }
@@ -301,6 +437,7 @@ class WebSocketCloverTransport: CloverTransport {
             }
         })
     }
+    
     @objc fileprivate func disconnectMissedPong() {
         processQueue.async(execute: { [weak self] in
             guard let self = self else { return }
@@ -308,7 +445,8 @@ class WebSocketCloverTransport: CloverTransport {
             if let ws = self.socket,
                 let _ = self.endpoint {
                 CCLog.d("forcing disconnect " + self.df.string(from: Date()))
-                ws.disconnect(forceTimeout: 0)
+                //ws.disconnect(forceTimeout: 0)
+                ws.disconnect()
             } else {
                 self.dispose()
                 // should we initialize here? how do we get in this state without messing up the state of the Transport?
@@ -338,20 +476,19 @@ class WebSocketCloverTransport: CloverTransport {
         return 0
     }
     
+    func connect(_ timeoutInSec: Int) {
+        socket?.connect()
+        let delayTime = DispatchTime.now() + Double(Int64(Double(timeoutInSec) * Double(NSEC_PER_SEC))) / Double(NSEC_PER_SEC)
+        DispatchQueue.global(qos: DispatchQoS.QoSClass.default).asyncAfter(deadline: delayTime, execute: {
+            if !self.isConnected {
+                //socket?.disconnect(forceTimeout: 0)
+                self.socket?.disconnect()
+            }
+        })
+    }
+    
     func reconnect() {
         
     }
 
-}
-
-extension WebSocket {
-    public func connect(_ timeoutInSec: Int) {
-        connect()
-        let delayTime = DispatchTime.now() + Double(Int64(Double(timeoutInSec) * Double(NSEC_PER_SEC))) / Double(NSEC_PER_SEC)
-        DispatchQueue.global(qos: DispatchQoS.QoSClass.default).asyncAfter(deadline: delayTime, execute: {
-            if !self.isConnected {
-                self.disconnect(forceTimeout: 0)
-            }
-        })
-    }
 }
