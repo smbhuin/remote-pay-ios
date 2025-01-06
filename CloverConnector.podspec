@@ -97,7 +97,7 @@ DESC
   s.homepage         = 'https://docs.clover.com/build/integration-overview-requirements/'
   s.license          = { :type => 'Custom', :file => 'LICENSE' }
   s.author           = { 'Clover' => 'semi-integrations@clover.com' }
-  s.source           = { :git => 'https://github.com/smbhuin/remote-pay-ios.git', :tag => s.version.to_s }
+  s.source           = { :git => 'https://github.com/smbhuin/remote-pay-ios.git', :branch => 'master' }
 
   # s.pod_target_xcconfig = { 'SWIFT_VERSION' => '5.3' }
   s.swift_version = '5.0'
